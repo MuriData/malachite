@@ -25,8 +25,17 @@ where
     // Get all proposals we have for this value.
     let proposals = state.proposals_for_value(&proposed_value);
 
-    // Apply all proposals we have for this value, with the stored validity.
+    // Apply all proposals we have for this value, each with the validity of its own entry: a
+    // proposal without a proof-of-lock round is judged by the copy reported for its round.
     for signed_proposal in proposals {
+        let validity = state
+            .full_proposal_at_round_and_value(
+                &signed_proposal.height(),
+                signed_proposal.round(),
+                &proposed_value.value,
+            )
+            .map_or(validity, |full_proposal| full_proposal.validity);
+
         debug!(
             proposal.height = %signed_proposal.height(),
             proposal.round = %signed_proposal.round(),

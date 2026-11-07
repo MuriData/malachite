@@ -389,7 +389,7 @@ where
 
         if self
             .full_proposal_keeper
-            .has_matching_entry(height, value_id)
+            .has_matching_entry(height, round, value_id)
         {
             return Ok(ProposedValueStorage::MatchingEntriesOnly);
         }

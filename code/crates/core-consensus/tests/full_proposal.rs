@@ -208,17 +208,24 @@ fn full_proposal_keeper_tests() {
             ),
         },
         Case {
-            name: "BASIC: value r0 id 10 then proposal r2 id 10 nil pol — cross-round Full",
+            name: "BASIC: value r0 id 10 then proposal r2 id 10 nil pol — no cross-round Full",
             input: vec![
                 value_input(a1, 0, 10, Validity::Valid),
                 proposal_input(&c1, a1, 2, 10, -1),
             ],
-            expect_full_for: vec![(2, 10)],
-            expect_not_full_for: vec![],
-            proposals_for: (
-                proposed_value(a1, 0, 10, Validity::Valid),
-                vec![signed_proposal(&c1, a1, 2, 10, -1)],
-            ),
+            expect_full_for: vec![],
+            expect_not_full_for: vec![(0, 10), (2, 10)],
+            proposals_for: (proposed_value(a1, 0, 10, Validity::Valid), vec![]),
+        },
+        Case {
+            name: "BASIC: proposal r2 id 10 nil pol then value r0 id 10 — no cross-round Full",
+            input: vec![
+                proposal_input(&c1, a1, 2, 10, -1),
+                value_input(a1, 0, 10, Validity::Valid),
+            ],
+            expect_full_for: vec![],
+            expect_not_full_for: vec![(0, 10), (2, 10)],
+            proposals_for: (proposed_value(a1, 0, 10, Validity::Valid), vec![]),
         },
         // --- POL (non-nil pol_round) ---
         Case {
@@ -499,7 +506,8 @@ fn validity_upgrade_propagates_to_all_higher_round_full_entries() {
 /// (`Invalid` at round 1, `Valid` at round 2) and asserts the keeper converges to
 /// `Valid` everywhere — under all four `(Kind, Kind)` configurations of the two
 /// entries. If any one configuration diverges from the others, validity
-/// reconciliation is treating `ValueOnly` and `Full` non-uniformly.
+/// reconciliation is treating `ValueOnly` and `Full` non-uniformly. The proposals
+/// re-propose the value with a proof-of-lock round, so they pair across rounds.
 #[test]
 fn validity_reconciles_uniformly_across_value_only_and_full() {
     let [(v1, _), (v2, sk2)] = make_validators([1, 1]);
@@ -517,7 +525,8 @@ fn validity_reconciles_uniformly_across_value_only_and_full() {
         |k: &mut FullProposalKeeper<TestContext>, round: u32, validity: Validity, kind: Kind| {
             k.store_value(&proposed_value(a1, round, 10, validity));
             if matches!(kind, Kind::Full) {
-                let _ = k.store_proposal(signed_proposal(&c2, a2, round, 10, -1), false);
+                let pol_round = i64::from(round) - 1;
+                let _ = k.store_proposal(signed_proposal(&c2, a2, round, 10, pol_round), false);
             }
         };
 
@@ -635,6 +644,96 @@ fn prior_valid_is_not_downgraded_by_later_invalid_at_other_round() {
             }
         }
     }
+}
+
+/// A proposal without a proof-of-lock round proposes a value built in its own round, so a value
+/// reported for an earlier round does not complete it, whichever arrives first.
+#[test]
+fn nil_proposal_does_not_pair_with_an_earlier_round_value() {
+    let [(v, sk)] = make_validators([1]);
+    let signer = Ed25519Signer::new(sk);
+    let addr = v.address;
+    let mut keeper = FullProposalKeeper::<TestContext>::new();
+
+    keeper.store_value(&proposed_value(addr, 1, 10, Validity::Valid));
+    let _ = keeper.store_proposal(signed_proposal(&signer, addr, 5, 10, -1), false);
+
+    assert!(full_proposal_at(&keeper, 5, 10).is_none());
+    let (_, validity) = keeper
+        .get_value_by_id(&Height::new(1), &Value::new(10).id())
+        .expect("the round 1 value is stored");
+    assert_eq!(validity, Validity::Valid);
+}
+
+#[test]
+fn value_from_an_earlier_round_does_not_complete_a_nil_proposal() {
+    let [(v, sk)] = make_validators([1]);
+    let signer = Ed25519Signer::new(sk);
+    let addr = v.address;
+    let mut keeper = FullProposalKeeper::<TestContext>::new();
+
+    let _ = keeper.store_proposal(signed_proposal(&signer, addr, 5, 10, -1), false);
+    keeper.store_value(&proposed_value(addr, 1, 10, Validity::Valid));
+    assert!(full_proposal_at(&keeper, 5, 10).is_none());
+
+    // The copy reported for round 5 completes it.
+    keeper.store_value(&proposed_value(addr, 5, 10, Validity::Valid));
+    let full = full_proposal_at(&keeper, 5, 10).expect("the round 5 copy completes the proposal");
+    assert_eq!(full.validity, Validity::Valid);
+}
+
+/// A value an earlier round judged valid and a later proposer proposes again as new is judged by
+/// the copy reported for the later round, and reports for the earlier round do not change that
+/// verdict, whichever order the reports and the proposal arrive in.
+#[test]
+fn relabeled_copy_keeps_its_own_verdict() {
+    let [(v, sk)] = make_validators([1]);
+    let signer = Ed25519Signer::new(sk);
+    let addr = v.address;
+    let earlier = proposed_value(addr, 1, 10, Validity::Valid);
+    let relabeled = proposed_value(addr, 5, 10, Validity::Invalid);
+    let proposal = signed_proposal(&signer, addr, 5, 10, -1);
+
+    // The earlier copy, the proposal, then the relabeled copy.
+    let mut keeper = FullProposalKeeper::<TestContext>::new();
+    keeper.store_value(&earlier);
+    let _ = keeper.store_proposal(proposal.clone(), false);
+    keeper.store_value(&relabeled);
+    let full = full_proposal_at(&keeper, 5, 10).expect("the round 5 copy completes the proposal");
+    assert_eq!(full.validity, Validity::Invalid);
+
+    keeper.store_value(&earlier);
+    let full = full_proposal_at(&keeper, 5, 10).expect("the proposal stays complete");
+    assert_eq!(full.validity, Validity::Invalid);
+    let (_, validity) = keeper
+        .get_value_by_id(&Height::new(1), &Value::new(10).id())
+        .expect("the value is stored");
+    assert_eq!(validity, Validity::Valid);
+
+    // The relabeled copy, the earlier copy, then the proposal.
+    let mut keeper = FullProposalKeeper::<TestContext>::new();
+    keeper.store_value(&relabeled);
+    keeper.store_value(&earlier);
+    let _ = keeper.store_proposal(proposal, false);
+    let full = full_proposal_at(&keeper, 5, 10).expect("the round 5 copy completes the proposal");
+    assert_eq!(full.validity, Validity::Invalid);
+}
+
+/// A proposal with a proof-of-lock round re-proposes a value from an earlier round, so it pairs
+/// by value id and takes the value's validity across the height.
+#[test]
+fn pol_proposal_takes_the_validity_of_any_valid_copy() {
+    let [(v, sk)] = make_validators([1]);
+    let signer = Ed25519Signer::new(sk);
+    let addr = v.address;
+    let mut keeper = FullProposalKeeper::<TestContext>::new();
+
+    keeper.store_value(&proposed_value(addr, 1, 10, Validity::Valid));
+    keeper.store_value(&proposed_value(addr, 5, 10, Validity::Invalid));
+    let _ = keeper.store_proposal(signed_proposal(&signer, addr, 5, 10, 1), false);
+
+    let full = full_proposal_at(&keeper, 5, 10).expect("the proposal pairs by value id");
+    assert_eq!(full.validity, Validity::Valid);
 }
 
 #[test]

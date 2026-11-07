@@ -487,10 +487,11 @@ fn sync_value_stored_beyond_cap_pairs_with_later_same_round_proposal() {
             filler_value,
         ))
     }));
-    inputs.push(Input::Proposal(signed_proposal(
+    inputs.push(Input::Proposal(signed_proposal_with_pol_round(
         other_proposer,
         round_number(other_round),
         value,
+        source_round,
     )));
     inputs.push(Input::ProposedValue(
         proposed_value(source_proposer, round_number(source_round), value),
@@ -515,6 +516,59 @@ fn sync_value_stored_beyond_cap_pairs_with_later_same_round_proposal() {
     assert!(state
         .full_proposal_at_round_and_value(&height, other_round, &Value::new(value))
         .is_some());
+}
+
+/// A consensus value whose source bucket is full is dropped when its only matching entry is a
+/// proposal without a proof-of-lock round at another round: that proposal pairs only with a value
+/// of its own round, so the value has no bounded placement.
+#[test]
+fn value_matching_only_a_nil_proposal_of_another_round_is_dropped() {
+    let validators: Vec<_> = make_validators([1, 1, 1])
+        .into_iter()
+        .map(|(v, _)| v)
+        .collect();
+    let height = Height::new(1);
+    let source_round = Round::new(0);
+    let other_round = Round::new(1);
+    let value = MAX_PROPOSALS_PER_ROUND as u64;
+    let proposer_state = make_state(
+        &validators,
+        validators[0].address,
+        ValuePayload::ProposalAndParts,
+    );
+    let source_proposer = *proposer_state.get_proposer(height, source_round);
+    let other_proposer = *proposer_state.get_proposer(height, other_round);
+    let driven_proposers = [source_proposer, other_proposer];
+    let me = validators
+        .iter()
+        .find(|validator| !driven_proposers.contains(&validator.address))
+        .expect("a validator that does not propose in the driven rounds")
+        .address;
+    let mut state = make_state(&validators, me, ValuePayload::ProposalAndParts);
+
+    let mut inputs = vec![Input::StartHeight(
+        height,
+        ValidatorSet::new(validators.clone()),
+        false,
+        None,
+        Default::default(),
+    )];
+    inputs
+        .extend((0..MAX_PROPOSALS_PER_ROUND as u64).map(|filler_value| {
+            Input::Proposal(signed_proposal(source_proposer, 0, filler_value))
+        }));
+    inputs.push(Input::Proposal(signed_proposal(other_proposer, 1, value)));
+    inputs.push(Input::ProposedValue(
+        proposed_value(source_proposer, 0, value),
+        ValueOrigin::Consensus,
+    ));
+
+    let captured = drive(&mut state, inputs);
+
+    assert_eq!(proposed_values_in_wal(&captured), 0);
+    assert!(state
+        .full_proposal_at_round_and_value(&height, other_round, &Value::new(value))
+        .is_none());
 }
 
 #[test]
@@ -784,10 +838,13 @@ fn valid_redelivery_updates_matching_full_entry_when_source_round_is_full() {
             filler_value,
         ))
     }));
-    inputs.push(Input::Proposal(signed_proposal(
+    // The round 1 proposal re-proposes the value with a proof-of-lock round, so it pairs with a
+    // value reported for another round, and the round 0 polka lets the node prevote it (L28).
+    inputs.push(Input::Proposal(signed_proposal_with_pol_round(
         proposal_proposer,
         round_number(proposal_round),
         value,
+        source_round,
     )));
     inputs.push(Input::ProposedValue(invalid_value, ValueOrigin::Consensus));
     inputs.push(Input::ProposedValue(
@@ -795,6 +852,11 @@ fn valid_redelivery_updates_matching_full_entry_when_source_round_is_full() {
         ValueOrigin::Consensus,
     ));
     inputs.push(Input::TimeoutElapsed(Timeout::propose(source_round)));
+    inputs.push(Input::PolkaCertificate(polka_certificate(
+        &validators,
+        round_number(source_round),
+        value,
+    )));
     inputs.push(Input::RoundCertificate(RoundCertificate::new_from_votes(
         height,
         source_round,
@@ -816,7 +878,13 @@ fn valid_redelivery_updates_matching_full_entry_when_source_round_is_full() {
         .full_proposal_at_round_and_value(&height, proposal_round, &Value::new(value))
         .expect("matching proposal should be complete");
     assert_eq!(full_proposal.validity, Validity::Valid);
-    assert!(state.exceeds_per_round_cap(height, source_round, &Value::new(value).id()));
+    // The source bucket did not grow. The polka exempts the value from the cap, so the bucket is
+    // checked directly.
+    assert!(state.full_proposal_keeper.would_append_distinct(
+        height,
+        source_round,
+        &Value::new(value).id()
+    ));
     assert_value_prevote(&captured, height, proposal_round, value);
 }
 
