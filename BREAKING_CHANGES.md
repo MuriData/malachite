@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### `malachitebft-engine`
+
+- `HostMsg::ProcessSyncedValue` gained a `value_id: ValueId<Ctx>` field, the value ID of the verified commit certificate, so that the host can refuse other values before it stores them. Hosts that build or match this variant must add the field.
+
+### `malachitebft-app-channel`
+
+- `AppMsg::ProcessSyncedValue` gained the same `value_id: ValueId<Ctx>` field. Applications that match this variant must add it.
+
 ## 0.8.1
 
 *October 6th, 2026*

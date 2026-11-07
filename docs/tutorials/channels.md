@@ -1385,10 +1385,11 @@ to decode it from its wire format and send back the decoded value to consensus.
                 height,
                 round,
                 proposer,
+                value_id,
                 value_bytes,
                 reply,
             } => {
-                info!(%height, %round, "Processing synced value");
+                info!(%height, %round, %value_id, "Processing synced value");
 
                 let value = decode_value(value_bytes);
                 let proposed_value = ProposedValue {
@@ -1408,7 +1409,8 @@ to decode it from its wire format and send back the decoded value to consensus.
                 // Reply with how the value was processed. Here decoding always
                 // succeeds, so we return a `Verdict`. A real application would
                 // reply with `SyncedValueOutcome::PeerFault` if the bytes are a
-                // peer-attributable fault (e.g. undecodable), or
+                // peer-attributable fault (e.g. undecodable, or a value whose ID
+                // is not the certificate's `value_id`), or
                 // `SyncedValueOutcome::LocalTransientError` on a local/transient
                 // failure so the peer is not penalized.
                 if reply

@@ -1729,6 +1729,7 @@ where
                 let request_id = state.sync_request_id;
                 let certificate_height = value.certificate.height;
                 let certificate_round = value.certificate.round;
+                let certificate_value_id = value.certificate.value_id.clone();
 
                 let sync = Arc::clone(&self.sync);
                 let myself = myself.clone();
@@ -1760,6 +1761,7 @@ where
                         height: certificate_height,
                         round: certificate_round,
                         proposer,
+                        value_id: certificate_value_id,
                         value_bytes: value.value_bytes,
                         reply_to,
                     },

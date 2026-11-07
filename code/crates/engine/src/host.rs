@@ -280,6 +280,9 @@ pub enum HostMsg<Ctx: Context> {
         round: Round,
         /// Address of the original proposer
         proposer: Ctx::Address,
+        /// ID of the value that the verified commit certificate decides. A value
+        /// whose bytes decode to another ID is not the decided value.
+        value_id: ValueId<Ctx>,
         /// Raw encoded value data
         value_bytes: Bytes,
         /// Channel for sending back how the synced value was processed.

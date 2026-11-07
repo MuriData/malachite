@@ -405,6 +405,7 @@ pub async fn run(state: &mut State, channels: &mut Channels<TestContext>) -> eyr
                 height,
                 round,
                 proposer,
+                value_id,
                 value_bytes,
                 reply,
             } => {
@@ -431,6 +432,10 @@ pub async fn run(state: &mut State, channels: &mut Channels<TestContext>) -> eyr
                     } else {
                         decode_value(value_bytes)
                     };
+
+                    // A value other than the one the certificate decides is a
+                    // peer-attributable fault, like undecodable bytes.
+                    let decoded = decoded.filter(|value| value.id() == value_id);
 
                     if let Some(value) = decoded {
                         let proposal = ProposedValue {

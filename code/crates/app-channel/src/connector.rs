@@ -267,6 +267,7 @@ where
                 height,
                 round,
                 proposer,
+                value_id,
                 value_bytes,
                 reply_to,
             } => {
@@ -277,6 +278,7 @@ where
                         height,
                         round,
                         proposer,
+                        value_id,
                         value_bytes,
                         reply,
                     })
