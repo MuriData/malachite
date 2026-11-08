@@ -149,6 +149,26 @@ fn value(proposer: Address, round: u32, validity: Validity) -> Input<TestContext
     )
 }
 
+/// The application's report of `X` for `round`, re-proposed there from `valid_round`.
+fn reproposed(
+    proposer: Address,
+    round: u32,
+    valid_round: u32,
+    validity: Validity,
+) -> Input<TestContext> {
+    Input::ProposedValue(
+        ProposedValue {
+            height: Height::new(1),
+            round: Round::new(round),
+            valid_round: Round::new(valid_round),
+            proposer,
+            value: Value::new(X),
+            validity,
+        },
+        ValueOrigin::Consensus,
+    )
+}
+
 /// Drive `inputs` into `state`. Step tracking needs `metrics` shared across calls on one state.
 fn drive(
     state: &mut State<TestContext>,
@@ -230,6 +250,88 @@ fn replayed_relabel_is_not_prevoted() {
     let me = bystanders(&validators)[0];
     let mut state = make_state(&validators, me);
     let captured = drive(&mut state, &Metrics::new(), relabel_inputs(&validators));
+
+    let mut replay = vec![start_height(&validators, true)];
+    replay.extend(captured.wal.iter().cloned());
+    let mut replay_state = make_state(&validators, me);
+    let cap = drive(&mut replay_state, &Metrics::new(), replay);
+
+    assert_eq!(replay_state.round(), Round::new(2));
+    assert!(!prevoted_x_in_round_2(&cap));
+    assert!(replay_state
+        .full_proposal_at_round_and_value(&Height::new(1), Round::new(2), &Value::new(X))
+        .is_none());
+}
+
+/// The node in round 2 has a copy of `X` that round 2's proposer streamed as re-proposed from
+/// round 0, which skipped the checks of a value built in its round, and a round 2 proposal of `X`
+/// without a proof-of-lock round.
+fn relabel_in_round_inputs(validators: &[Validator]) -> Vec<Input<TestContext>> {
+    let others = bystanders(validators);
+    vec![
+        start_height(validators, false),
+        round_2_prevote(others[1]),
+        round_2_prevote(proposer(validators, 0)),
+        reproposed(proposer(validators, 2), 2, 0, Validity::Valid),
+        nil_proposal(proposer(validators, 2), 2),
+    ]
+}
+
+#[test]
+fn nil_proposal_is_not_prevoted_on_a_re_proposed_copy_of_its_round() {
+    let validators = validators();
+    let mut state = make_state(&validators, bystanders(&validators)[0]);
+    let metrics = Metrics::new();
+
+    let cap = drive(&mut state, &metrics, relabel_in_round_inputs(&validators));
+    assert_eq!(state.round(), Round::new(2));
+    assert!(!prevoted_x_in_round_2(&cap));
+    assert!(state
+        .full_proposal_at_round_and_value(&Height::new(1), Round::new(2), &Value::new(X))
+        .is_none());
+
+    // The copy reported as built in round 2 completes the proposal, with its own verdict.
+    let cap = drive(
+        &mut state,
+        &metrics,
+        vec![value(proposer(&validators, 2), 2, Validity::Invalid)],
+    );
+    assert!(!prevoted_x_in_round_2(&cap));
+    let full = state
+        .full_proposal_at_round_and_value(&Height::new(1), Round::new(2), &Value::new(X))
+        .expect("the copy built in round 2 completes the proposal");
+    assert_eq!(full.validity, Validity::Invalid);
+}
+
+#[test]
+fn a_re_proposed_copy_after_the_nil_proposal_does_not_complete_it() {
+    let validators = validators();
+    let mut state = make_state(&validators, bystanders(&validators)[0]);
+    let metrics = Metrics::new();
+
+    let mut inputs = relabel_in_round_inputs(&validators);
+    inputs.swap(3, 4);
+    let cap = drive(&mut state, &metrics, inputs);
+    assert!(!prevoted_x_in_round_2(&cap));
+
+    let cap = drive(
+        &mut state,
+        &metrics,
+        vec![value(proposer(&validators, 2), 2, Validity::Valid)],
+    );
+    assert!(prevoted_x_in_round_2(&cap));
+}
+
+#[test]
+fn replayed_re_proposed_copy_is_not_prevoted() {
+    let validators = validators();
+    let me = bystanders(&validators)[0];
+    let mut state = make_state(&validators, me);
+    let captured = drive(
+        &mut state,
+        &Metrics::new(),
+        relabel_in_round_inputs(&validators),
+    );
 
     let mut replay = vec![start_height(&validators, true)];
     replay.extend(captured.wal.iter().cloned());

@@ -117,7 +117,7 @@ where
     // full source bucket, or be retained at a round where it holds a polka certificate.
     let value_id = proposed_value.value.id();
     let storage = if origin.is_consensus() {
-        match state.proposed_value_storage(proposed_value.height, proposed_value.round, &value_id) {
+        match state.proposed_value_storage(&proposed_value) {
             Ok(storage) => storage,
             Err(error) => {
                 warn!(

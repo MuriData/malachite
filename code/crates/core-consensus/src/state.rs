@@ -376,10 +376,9 @@ where
     /// Select where to retain a proposed value, or reject it if no bounded placement exists.
     pub(crate) fn proposed_value_storage(
         &self,
-        height: Ctx::Height,
-        round: Round,
-        value_id: &ValueId<Ctx>,
+        value: &ProposedValue<Ctx>,
     ) -> Result<ProposedValueStorage, ProposedValueStorageError> {
+        let (height, round, value_id) = (value.height, value.round, &value.value.id());
         if !self
             .full_proposal_keeper
             .would_append_distinct(height, round, value_id)
@@ -387,10 +386,7 @@ where
             return Ok(ProposedValueStorage::SourceRoundAndMatchingEntries);
         }
 
-        if self
-            .full_proposal_keeper
-            .has_matching_entry(height, round, value_id)
-        {
+        if self.full_proposal_keeper.has_matching_entry(value) {
             return Ok(ProposedValueStorage::MatchingEntriesOnly);
         }
 

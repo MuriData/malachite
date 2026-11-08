@@ -736,6 +736,72 @@ fn pol_proposal_takes_the_validity_of_any_valid_copy() {
     assert_eq!(full.validity, Validity::Valid);
 }
 
+/// A value that a round's proposer streams as re-proposed there, with a valid round, skipped the
+/// checks of a value built in the round, so it does not complete the round's proposal without a
+/// proof-of-lock round, whichever arrives first. A report of the value as built in the round
+/// completes it, with that report's validity alone, and the re-proposed copy still pairs with
+/// proposals that re-propose the value.
+#[test]
+fn nil_proposal_does_not_pair_with_a_re_proposed_copy_of_its_round() {
+    let [(v, sk)] = make_validators([1]);
+    let signer = Ed25519Signer::new(sk);
+    let addr = v.address;
+    let reproposed = ProposedValue {
+        valid_round: Round::new(1),
+        ..proposed_value(addr, 5, 10, Validity::Valid)
+    };
+    let built = proposed_value(addr, 5, 10, Validity::Invalid);
+    let proposal = signed_proposal(&signer, addr, 5, 10, -1);
+
+    for proposal_first in [false, true] {
+        let mut keeper = FullProposalKeeper::<TestContext>::new();
+        if proposal_first {
+            let _ = keeper.store_proposal(proposal.clone(), false);
+            keeper.store_value(&reproposed);
+        } else {
+            keeper.store_value(&reproposed);
+            let _ = keeper.store_proposal(proposal.clone(), false);
+        }
+        assert!(full_proposal_at(&keeper, 5, 10).is_none());
+        let (_, validity) = keeper
+            .get_value_by_id(&Height::new(1), &Value::new(10).id())
+            .expect("the re-proposed copy is stored");
+        assert_eq!(validity, Validity::Valid);
+
+        let pol_proposal = signed_proposal(&signer, addr, 6, 10, 1);
+        let _ = keeper.store_proposal(pol_proposal, false);
+        let full = full_proposal_at(&keeper, 6, 10).expect("a re-proposal pairs with the copy");
+        assert_eq!(full.validity, Validity::Valid);
+
+        keeper.store_value(&built);
+        let full = full_proposal_at(&keeper, 5, 10).expect("the built copy completes it");
+        assert_eq!(full.validity, Validity::Invalid);
+        keeper.store_value(&reproposed);
+        let full = full_proposal_at(&keeper, 5, 10).expect("the proposal stays complete");
+        assert_eq!(full.validity, Validity::Invalid);
+    }
+}
+
+/// The first report of a value as built in a round replaces the verdict of a copy re-proposed
+/// there, which a later proposal without a proof-of-lock round would otherwise take.
+#[test]
+fn a_built_copy_replaces_the_verdict_of_a_re_proposed_one() {
+    let [(v, sk)] = make_validators([1]);
+    let signer = Ed25519Signer::new(sk);
+    let addr = v.address;
+    let mut keeper = FullProposalKeeper::<TestContext>::new();
+
+    keeper.store_value(&ProposedValue {
+        valid_round: Round::new(1),
+        ..proposed_value(addr, 5, 10, Validity::Valid)
+    });
+    keeper.store_value(&proposed_value(addr, 5, 10, Validity::Invalid));
+    let _ = keeper.store_proposal(signed_proposal(&signer, addr, 5, 10, -1), false);
+
+    let full = full_proposal_at(&keeper, 5, 10).expect("the built copy completes the proposal");
+    assert_eq!(full.validity, Validity::Invalid);
+}
+
 #[test]
 fn store_proposal_surfaces_equivocation_against_proposal_only_entry() {
     let [(v, sk)] = make_validators([1]);

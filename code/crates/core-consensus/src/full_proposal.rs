@@ -46,8 +46,16 @@ pub enum Entry<Ctx: Context> {
     /// Only the proposal has been received.
     ProposalOnly(SignedProposal<Ctx>),
 
-    /// Only the value has been received.
-    ValueOnly(Ctx::Value, Validity),
+    /// Only the value has been received, with its validity and whether a report of it stands for
+    /// the value as built in this round: one without a valid round, or one retained here for its
+    /// polka certificate.
+    ValueOnly(Ctx::Value, Validity, bool),
+
+    /// A proposal without a proof-of-lock round, and its value reported for the proposal's round
+    /// only as re-proposed there, with a valid round. The value does not complete the proposal,
+    /// which waits for a report of the value as built in its round, but proposals with a
+    /// proof-of-lock round still pair with the value and its validity.
+    Unpaired(SignedProposal<Ctx>, Ctx::Value, Validity),
 
     // This is a placeholder for converting a partial
     // entry (`ProposalOnly` or `ValueOnly`) to a full entry (`Full`).
@@ -65,8 +73,8 @@ impl<Ctx: Context> Entry<Ctx> {
     fn value_id(&self) -> Option<ValueId<Ctx>> {
         match self {
             Entry::Full(p) => Some(p.proposal.value().id()),
-            Entry::ProposalOnly(p) => Some(p.value().id()),
-            Entry::ValueOnly(v, _) => Some(v.id()),
+            Entry::ProposalOnly(p) | Entry::Unpaired(p, ..) => Some(p.value().id()),
+            Entry::ValueOnly(v, ..) => Some(v.id()),
             Entry::Empty => None,
         }
     }
@@ -75,7 +83,7 @@ impl<Ctx: Context> Entry<Ctx> {
     fn proposal(&self) -> Option<&SignedProposal<Ctx>> {
         match self {
             Entry::Full(p) => Some(&p.proposal),
-            Entry::ProposalOnly(p) => Some(p),
+            Entry::ProposalOnly(p) | Entry::Unpaired(p, ..) => Some(p),
             Entry::ValueOnly(..) => None,
             Entry::Empty => None,
         }
@@ -128,10 +136,12 @@ pub enum StoreProposalResult<Ctx: Context> {
 /// Each `(height, round)` holds a small vector of [`Entry`] values, where an entry records how much
 /// of a proposed value is currently held:
 ///
-/// - `Entry::ValueOnly(value, validity)` — a value arrived from the value builder, with no matching
-///   proposal yet.
+/// - `Entry::ValueOnly(value, validity, built)` — a value arrived from the value builder, with no
+///   matching proposal yet.
 /// - `Entry::ProposalOnly(proposal)` — a proposal arrived over consensus gossip, with no matching
 ///   value yet.
+/// - `Entry::Unpaired(proposal, value, validity)` — a proposal without a proof-of-lock round and
+///   a value reported for its round only as re-proposed there, which cannot complete it.
 /// - `Entry::Full(value, validity, proposal)` — both halves are present. It is formed when the
 ///   second half arrives: a proposal that finds an existing value, or a value that finds an
 ///   existing proposal.
@@ -140,11 +150,13 @@ pub enum StoreProposalResult<Ctx: Context> {
 ///
 /// How a proposal pairs depends on its `pol_round`:
 /// - A proposal without a proof-of-lock round (nil `pol_round`) proposes a value built in its own
-///   round (Tendermint L14–L19), so it pairs only with a value reported for that round: an entry
-///   in its own `(height, round)` bucket. It takes that entry's validity, and values reported for
-///   other rounds neither complete it nor change its validity. An application may judge a value
-///   built in the current round more strictly than one re-proposed from an earlier round, and
-///   pairing a new proposal with an earlier round's copy would skip those checks.
+///   round (Tendermint L14–L19), so it pairs only with a value reported for that round as built
+///   there: an entry in its own `(height, round)` bucket whose report has no valid round. It takes
+///   that report's validity, and values reported for other rounds, or for its round with a valid
+///   round, neither complete it nor change its validity. An application may judge a value built in
+///   the current round more strictly than one re-proposed from an earlier round, and pairing a new
+///   proposal with an earlier round's copy, or with a copy its round re-proposes, would skip those
+///   checks.
 /// - A proposal with a proof-of-lock round re-proposes a value from an earlier round, so it pairs
 ///   by value id with a value stored at any round of the height, and its validity is the value's:
 ///   `Valid` if any copy of the value at the height is valid (see `get_value_by_id`).
@@ -155,7 +167,8 @@ pub enum StoreProposalResult<Ctx: Context> {
 /// it there, so it pairs with that round's proposal), and `store_value_in_matching_entries` only
 /// updates existing entries without growing any bucket. Within a bucket, and for entries whose
 /// proposal has a proof-of-lock round, validity is reconciled along the way (`Invalid -> Valid`
-/// propagates, `Valid -> Invalid` is logged and rejected).
+/// propagates, `Valid -> Invalid` is logged and rejected), except that the first report of a
+/// value as built in its round replaces the validity of reports that re-proposed it there.
 ///
 /// A proposer may send more than one proposal for the same `(height, round)`. Either way the
 /// conflict is reported as soon as the second proposal arrives, from the two signatures alone, so
@@ -219,21 +232,16 @@ impl<Ctx: Context> FullProposalKeeper<Ctx> {
                 .any(|e| e.value_id().as_ref() == Some(value_id))
     }
 
-    /// Returns `true` if an entry at `height` that references `value_id` would take or hold a
-    /// value reported for `round`: one that already holds the value, or a proposal that pairs
-    /// with it.
-    pub(crate) fn has_matching_entry(
-        &self,
-        height: Ctx::Height,
-        round: Round,
-        value_id: &ValueId<Ctx>,
-    ) -> bool {
-        self.entries_at(height).any(|(_, entries)| {
+    /// Returns `true` if an entry at `value`'s height that references its value id would take or
+    /// hold `value`: one that already holds the value, or a proposal that pairs with it.
+    pub(crate) fn has_matching_entry(&self, value: &ProposedValue<Ctx>) -> bool {
+        let value_id = value.value.id();
+        self.entries_at(value.height).any(|(_, entries)| {
             entries.iter().any(|entry| match entry {
                 Entry::ProposalOnly(proposal) => {
-                    proposal.value().id() == *value_id && pairs_with_round(proposal, round)
+                    proposal.value().id() == value_id && pairs_with(proposal, value)
                 }
-                entry => entry.value_id().as_ref() == Some(value_id),
+                entry => entry.value_id().as_ref() == Some(&value_id),
             })
         })
     }
@@ -319,7 +327,11 @@ impl<Ctx: Context> FullProposalKeeper<Ctx> {
                     Entry::Full(p) if p.proposal.value().id() == *value_id => {
                         (&p.builder_value, p.validity)
                     }
-                    Entry::ValueOnly(v, validity) if v.id() == *value_id => (v, *validity),
+                    Entry::ValueOnly(v, validity, _) | Entry::Unpaired(_, v, validity)
+                        if v.id() == *value_id =>
+                    {
+                        (v, *validity)
+                    }
                     _ => continue,
                 };
 
@@ -398,18 +410,23 @@ impl<Ctx: Context> FullProposalKeeper<Ctx> {
                                 };
                             }
                         }
-                        Entry::ValueOnly(value, _validity) => {
+                        Entry::ValueOnly(value, ..) => {
                             if value == new_proposal.value() {
-                                // Found a matching value. Add the proposal
-                                replace_with!(entry, Entry::ValueOnly(value, validity) => {
-                                    let validity = value_validity.unwrap_or(validity);
-                                    Entry::full(value, validity, new_proposal)
+                                // Found a matching value. Add the proposal, which a value reported
+                                // here as re-proposed completes only if it re-proposes too.
+                                replace_with!(entry, Entry::ValueOnly(value, validity, built) => {
+                                    if built || new_proposal.pol_round().is_defined() {
+                                        let validity = value_validity.unwrap_or(validity);
+                                        Entry::full(value, validity, new_proposal)
+                                    } else {
+                                        Entry::Unpaired(new_proposal, value, validity)
+                                    }
                                 });
 
                                 return StoreProposalResult::Stored;
                             }
                         }
-                        Entry::ProposalOnly(proposal) => {
+                        Entry::ProposalOnly(proposal) | Entry::Unpaired(proposal, ..) => {
                             if proposal.value().id() == new_proposal.value().id() {
                                 // Signatures are not part of proposal identity.
                                 return if proposal.message == new_proposal.message {
@@ -534,13 +551,14 @@ impl<Ctx: Context> FullProposalKeeper<Ctx> {
     fn store_value_in_round(&mut self, new_value: &ProposedValue<Ctx>, target_round: Round) {
         let key = (new_value.height, target_round);
         let value_validity = self.value_validity(new_value);
+        let built = built_in(new_value, target_round);
         let entries = self.keeper.get_mut(&key);
 
         match entries {
             None => {
                 // First entry at this `(height, round)`: store the value on its own as
                 // `ValueOnly`.
-                let entry = Entry::ValueOnly(new_value.value.clone(), new_value.validity);
+                let entry = Entry::ValueOnly(new_value.value.clone(), new_value.validity, built);
                 self.keeper.insert(key, vec![entry]);
             }
             Some(entries) => {
@@ -551,44 +569,81 @@ impl<Ctx: Context> FullProposalKeeper<Ctx> {
                     match entry {
                         Entry::ProposalOnly(proposal) => {
                             if proposal.value().id() == new_value.value.id() {
-                                // Found a matching proposal. Change the entry at index i
+                                // Found a matching proposal. Change the entry at index i: a
+                                // proposal without a proof-of-lock round waits for a report of
+                                // the value as built here.
                                 replace_with!(entry, Entry::ProposalOnly(proposal) => {
-                                    let validity = if proposal.pol_round().is_defined() {
-                                        value_validity
+                                    if proposal.pol_round().is_defined() {
+                                        Entry::full(new_value.value.clone(), value_validity, proposal)
+                                    } else if built {
+                                        Entry::full(new_value.value.clone(), new_value.validity, proposal)
                                     } else {
-                                        new_value.validity
-                                    };
-                                    Entry::full(new_value.value.clone(), validity, proposal)
+                                        Entry::Unpaired(proposal, new_value.value.clone(), new_value.validity)
+                                    }
                                 });
 
                                 return;
                             }
                         }
-                        Entry::ValueOnly(old_value, old_validity) => {
+                        Entry::Unpaired(proposal, _, validity) => {
+                            if proposal.value().id() == new_value.value.id() {
+                                if built {
+                                    // The value as built here completes the proposal, with the
+                                    // validity of this report alone.
+                                    replace_with!(entry, Entry::Unpaired(proposal, value, _) => {
+                                        Entry::full(value, new_value.validity, proposal)
+                                    });
+                                } else {
+                                    Self::handle_validity_change(
+                                        &new_value.height,
+                                        target_round,
+                                        &new_value.value.id(),
+                                        validity,
+                                        new_value.validity,
+                                        "re-proposed value",
+                                    );
+                                }
+                                return;
+                            }
+                        }
+                        Entry::ValueOnly(old_value, old_validity, old_built) => {
                             if old_value.id() == new_value.value.id() {
-                                // Same value received before; handle potential validity change.
-                                Self::handle_validity_change(
-                                    &new_value.height,
-                                    target_round,
-                                    &new_value.value.id(),
-                                    old_validity,
-                                    new_value.validity,
-                                    "value",
-                                );
+                                match (*old_built, built) {
+                                    // The first report of the value as built here replaces the
+                                    // verdict of reports that re-proposed it here, which skipped
+                                    // the checks of a value built in its round.
+                                    (false, true) => {
+                                        *old_validity = new_value.validity;
+                                        *old_built = true;
+                                    }
+                                    (true, false) => {}
+                                    _ => Self::handle_validity_change(
+                                        &new_value.height,
+                                        target_round,
+                                        &new_value.value.id(),
+                                        old_validity,
+                                        new_value.validity,
+                                        "value",
+                                    ),
+                                }
                                 return;
                             }
                         }
                         Entry::Full(full_proposal) => {
                             if full_proposal.proposal.value().id() == new_value.value.id() {
-                                // Same value received before; handle potential validity change.
-                                Self::handle_validity_change(
-                                    &new_value.height,
-                                    target_round,
-                                    &new_value.value.id(),
-                                    &mut full_proposal.validity,
-                                    new_value.validity,
-                                    "full proposal",
-                                );
+                                // Same value received before; handle potential validity change,
+                                // unless the proposal takes only reports of the value as built
+                                // here and this one is not.
+                                if built || full_proposal.proposal.pol_round().is_defined() {
+                                    Self::handle_validity_change(
+                                        &new_value.height,
+                                        target_round,
+                                        &new_value.value.id(),
+                                        &mut full_proposal.validity,
+                                        new_value.validity,
+                                        "full proposal",
+                                    );
+                                }
                                 return;
                             }
                         }
@@ -605,6 +660,7 @@ impl<Ctx: Context> FullProposalKeeper<Ctx> {
                 entries.push(Entry::ValueOnly(
                     new_value.value.clone(),
                     new_value.validity,
+                    built,
                 ));
             }
         }
@@ -622,7 +678,8 @@ impl<Ctx: Context> FullProposalKeeper<Ctx> {
     /// Apply `new_value` to every entry at the same height whose proposal pairs with it.
     ///
     /// A proposal with a proof-of-lock round pairs by value id at any round, and a proposal
-    /// without one only with a value of its own round (see [`FullProposalKeeper`]).
+    /// without one only with a value reported for its own round as built there (see
+    /// [`FullProposalKeeper`]).
     ///
     /// - `ProposalOnly` → upgrade to `Full` so restreamed parts can meet proposals.
     /// - `Full` → reconcile validity via `handle_validity_change` (only `Invalid -> Valid`
@@ -639,7 +696,7 @@ impl<Ctx: Context> FullProposalKeeper<Ctx> {
                 match entry {
                     Entry::ProposalOnly(proposal)
                         if proposal.value().id() == new_value.value.id()
-                            && pairs_with_round(proposal, new_value.round) =>
+                            && pairs_with(proposal, new_value) =>
                     {
                         replace_with!(entry, Entry::ProposalOnly(proposal) => {
                             let validity = if proposal.pol_round().is_defined() {
@@ -650,9 +707,17 @@ impl<Ctx: Context> FullProposalKeeper<Ctx> {
                             Entry::full(new_value.value.clone(), validity, proposal)
                         });
                     }
+                    Entry::Unpaired(proposal, ..)
+                        if proposal.value().id() == new_value.value.id()
+                            && pairs_with(proposal, new_value) =>
+                    {
+                        replace_with!(entry, Entry::Unpaired(proposal, value, _) => {
+                            Entry::full(value, new_value.validity, proposal)
+                        });
+                    }
                     Entry::Full(full_proposal)
                         if full_proposal.proposal.value().id() == new_value.value.id()
-                            && pairs_with_round(&full_proposal.proposal, new_value.round) =>
+                            && pairs_with(&full_proposal.proposal, new_value) =>
                     {
                         let new_validity = if full_proposal.proposal.pol_round().is_defined() {
                             validity
@@ -699,10 +764,19 @@ impl<Ctx: Context> FullProposalKeeper<Ctx> {
     }
 }
 
-/// Whether `proposal` pairs with a value reported for `round`: a proposal with a proof-of-lock
-/// round pairs with a value of any round, and one without only with a value of its own round.
-fn pairs_with_round<Ctx: Context>(proposal: &SignedProposal<Ctx>, round: Round) -> bool {
-    proposal.pol_round().is_defined() || proposal.round() == round
+/// Whether `proposal` pairs with `value`, reported for its source round: a proposal with a
+/// proof-of-lock round pairs with a value of any round, and one without only with a value
+/// reported for its own round as built there, without a valid round.
+fn pairs_with<Ctx: Context>(proposal: &SignedProposal<Ctx>, value: &ProposedValue<Ctx>) -> bool {
+    proposal.pol_round().is_defined()
+        || (proposal.round() == value.round && built_in(value, value.round))
+}
+
+/// Whether `value`, stored at `round`, stands there for the value as built in that round: it is
+/// reported for the round without a valid round, or retained there for its polka certificate,
+/// since a quorum prevoted it in that round.
+fn built_in<Ctx: Context>(value: &ProposedValue<Ctx>, round: Round) -> bool {
+    value.round != round || value.valid_round.is_nil()
 }
 
 #[cfg(test)]
@@ -925,7 +999,7 @@ mod tests {
         let value_ids: Vec<_> = bucket
             .iter()
             .map(|e| match e {
-                Entry::ValueOnly(v, _) => v.id(),
+                Entry::ValueOnly(v, ..) => v.id(),
                 other => panic!("expected ValueOnly entry, got {other:?}"),
             })
             .collect();
@@ -1033,7 +1107,7 @@ mod tests {
         // Mutate every bucket at height 1: replace the stored value's validity with Invalid.
         for (_, bucket) in keeper.entries_at_mut(Height::new(1)) {
             for entry in bucket.iter_mut() {
-                if let Entry::ValueOnly(_, validity) = entry {
+                if let Entry::ValueOnly(_, validity, _) = entry {
                     *validity = Validity::Invalid;
                 }
             }
@@ -1043,7 +1117,7 @@ mod tests {
         for (_, bucket) in keeper.entries_at(Height::new(1)) {
             for entry in bucket {
                 match entry {
-                    Entry::ValueOnly(_, validity) => assert_eq!(*validity, Validity::Invalid),
+                    Entry::ValueOnly(_, validity, _) => assert_eq!(*validity, Validity::Invalid),
                     other => panic!("expected ValueOnly entry, got {other:?}"),
                 }
             }
@@ -1053,7 +1127,7 @@ mod tests {
         for (_, bucket) in keeper.entries_at(Height::new(2)) {
             for entry in bucket {
                 match entry {
-                    Entry::ValueOnly(_, validity) => assert_eq!(*validity, Validity::Valid),
+                    Entry::ValueOnly(_, validity, _) => assert_eq!(*validity, Validity::Valid),
                     other => panic!("expected ValueOnly entry, got {other:?}"),
                 }
             }
