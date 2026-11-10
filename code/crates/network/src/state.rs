@@ -12,6 +12,7 @@ use malachitebft_sync as sync;
 
 use crate::behaviour::Behaviour;
 use crate::metrics::Metrics as NetworkMetrics;
+use crate::session::Sessions;
 use crate::{Channel, ChannelNames, PeerType, PersistentPeerError};
 use malachitebft_discovery::ConnectionDirection;
 
@@ -175,6 +176,8 @@ pub struct State {
     /// after that close is not stored (the peer is gone and Identify will not
     /// complete for this id).
     pub(crate) pending_verified_proofs: HashMap<libp2p::PeerId, Vec<u8>>,
+    /// The GossipSub subscriptions each peer announced in its current session.
+    pub(crate) sessions: Sessions,
 }
 
 impl State {
@@ -353,6 +356,7 @@ impl State {
             enable_explicit_peering,
             peer_info: HashMap::new(),
             pending_verified_proofs: HashMap::new(),
+            sessions: Sessions::default(),
         }
     }
 

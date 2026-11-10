@@ -31,6 +31,13 @@
 //! is no same-session retry; the proof is sent again in the next session, after
 //! the last connection closes and the peer reconnects.
 //!
+//! A peer that starts a new session while this node still holds a connection
+//! of its last one sends its proof on what it takes for a first connection,
+//! and this node, which takes it for an additional one, sends none. The
+//! network layer sees the peer announce its GossipSub subscriptions again and
+//! closes every connection to it, so that both sides start a new session and
+//! exchange proofs (see the `session` module).
+//!
 //! The proof is a static binding of (public_key, peer_id) and does not change
 //! with validator set membership. Whether the receiver classifies us as a
 //! validator depends on their own validator set.

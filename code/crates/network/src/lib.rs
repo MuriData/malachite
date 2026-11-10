@@ -41,6 +41,7 @@ pub mod peer_scoring;
 mod utils;
 
 mod ip_limits;
+mod session;
 pub mod validator_proof;
 
 // Re-export state types for external use (e.g., RPC)
@@ -52,6 +53,7 @@ use state::State;
 
 use behaviour::{Behaviour, NetworkEvent};
 use handle::Handle;
+use session::Announcement;
 
 const METRICS_PREFIX: &str = "malachitebft_network";
 const DISCOVERY_METRICS_PREFIX: &str = "malachitebft_discovery";
@@ -973,6 +975,7 @@ async fn handle_swarm_event(
                 }
                 // Also clean up any pending proof (proof verified before Identify completed)
                 state.pending_verified_proofs.remove(&peer_id);
+                state.sessions.end(&peer_id);
 
                 if let Err(e) = tx_event
                     .send(Event::PeerDisconnected(PeerId::from_libp2p(&peer_id)))
@@ -1130,8 +1133,8 @@ async fn handle_gossipsub_event(
     event: gossipsub::Event,
     config: &Config,
     _metrics: &Metrics,
-    _swarm: &mut swarm::Swarm<Behaviour>,
-    _state: &mut State,
+    swarm: &mut swarm::Swarm<Behaviour>,
+    state: &mut State,
     tx_event: &mpsc::Sender<Event>,
 ) -> ControlFlow<()> {
     match event {
@@ -1142,6 +1145,14 @@ async fn handle_gossipsub_event(
             }
 
             trace!("Peer {peer_id} subscribed to {topic}");
+
+            if state.sessions.subscribed(peer_id, topic.clone()) == Announcement::Repeated {
+                warn!(
+                    %peer_id, %topic,
+                    "Peer announced a subscription again, so it started a new session while a connection of its last one is open: closing every connection to it"
+                );
+                let _ = swarm.disconnect_peer_id(peer_id);
+            }
         }
 
         gossipsub::Event::Unsubscribed { peer_id, topic } => {
@@ -1151,6 +1162,8 @@ async fn handle_gossipsub_event(
             }
 
             trace!("Peer {peer_id} unsubscribed from {topic}");
+
+            state.sessions.unsubscribed(&peer_id, &topic);
         }
 
         gossipsub::Event::Message {

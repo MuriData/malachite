@@ -4,6 +4,7 @@
 
 ### `network`
 - Stop the network task when its control handle is dropped without a shutdown. The engine's network actor shuts its network down in `post_stop`, which ractor skips when it kills an actor, as it does to the children of a stopping actor. A node that stopped or crashed therefore left its network connected to its peers until the network next failed to hand an event to the dead actor, and a node started again in the same process could meet peers that still held a connection of its last run
+- Close every connection to a peer that announces a GossipSub subscription it already announced in the session. GossipSub sends a node's subscriptions, and the validator-proof protocol its proof, only on the first connection to a peer, so the announcement means that the peer started a new session while this node still held a connection of its last one: half open after a crash or a partition, or not yet seen closed. This node sent neither on the peer's new connection, so the peer could not publish to it, graft it into its mesh or take it for a validator for as long as any connection between them stayed open. Closing them starts a new session on both sides. For nodes on GossipSub, this lifts the known limitation of 0.8.2 below, which also kept such a peer from publishing consensus messages to this node directly
 
 ## 0.8.2
 
