@@ -24,6 +24,10 @@ impl RecvHandle {
     }
 }
 
+/// Controls the network task.
+///
+/// The task stops when this handle is dropped, as it does on [`Self::shutdown`],
+/// and its connections close with it.
 pub struct CtrlHandle {
     peer_id: PeerId,
     tx_ctrl: mpsc::Sender<CtrlMsg>,

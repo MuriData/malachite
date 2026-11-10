@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### `network`
+- Stop the network task when its control handle is dropped without a shutdown. The engine's network actor shuts its network down in `post_stop`, which ractor skips when it kills an actor, as it does to the children of a stopping actor. A node that stopped or crashed therefore left its network connected to its peers until the network next failed to hand an event to the dead actor, and a node started again in the same process could meet peers that still held a connection of its last run
+
 ## 0.8.2
 
 *October 19th, 2026*

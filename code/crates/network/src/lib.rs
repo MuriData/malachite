@@ -609,9 +609,13 @@ async fn run(
                 ControlFlow::Continue(())
             }
 
-            Some(ctrl) = rx_ctrl.recv() => {
-                handle_ctrl_msg(&mut swarm, &mut state, &config, ctrl).await
-            }
+            ctrl = rx_ctrl.recv() => match ctrl {
+                Some(ctrl) => handle_ctrl_msg(&mut swarm, &mut state, &config, ctrl).await,
+                // The control handle is gone without a shutdown, as when the
+                // engine's network actor is killed, so nothing can stop this task
+                // any more. Stop now: dropping the swarm closes its connections.
+                None => ControlFlow::Break(()),
+            },
 
             _ = periodic_timer.tick() => {
                 // Attempt to dial bootstrap nodes

@@ -1,6 +1,7 @@
 mod certificates;
 mod consensus_liveness;
 mod extended_commit;
+mod network_actor;
 mod node_supervisor;
 mod sync;
 mod validator_proof;
