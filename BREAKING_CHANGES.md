@@ -4,6 +4,7 @@
 
 ### `malachitebft-engine`
 
+- `network::State::Running` gained a `pending_proofs` field, the validator proofs received whose verification has not been reported, which the actor sends to each new subscriber. Code that builds or matches this variant without `..` must add the field.
 - `HostMsg::ProcessSyncedValue` gained a `value_id: ValueId<Ctx>` field, the value ID of the verified commit certificate, so that the host can refuse other values before it stores them. Hosts that build or match this variant must add the field.
 
 ### `malachitebft-app-channel`

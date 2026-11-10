@@ -65,6 +65,9 @@
 //! ### 3. `engine/network.rs` (Engine Layer - Decoding)
 //! - **Decode**: Proof bytes must decode as valid `ValidatorProof` → logged and ignored if not
 //! - **PeerId match**: `proof.peer_id` must equal sender's peer_id → DISCONNECT if not
+//! - **Late subscribers**: a proof is kept until its verification is reported or
+//!   the peer disconnects, and sent to each new subscriber, so that a proof that
+//!   arrived before the consensus actor subscribed is still verified
 //!
 //! ### 4. `engine/consensus.rs` (Consensus Layer - Cryptographic)
 //! - **Signature verification**: Proof signature must be valid for the public key → DISCONNECT if not

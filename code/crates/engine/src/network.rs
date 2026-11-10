@@ -145,6 +145,11 @@ pub enum State<Ctx: Context> {
         ctrl_handle: Box<CtrlHandle>,
         recv_task: JoinHandle<()>,
         inbound_requests: HashMap<InboundRequestId, request_response::InboundRequestId>,
+        /// The validator proofs received whose verification has not been reported yet.
+        ///
+        /// A peer sends its proof once per session, possibly before the consensus actor has
+        /// subscribed, so each new subscriber is sent these as it is sent the connected peers.
+        pending_proofs: Box<HashMap<PeerId, ValidatorProof<Ctx>>>,
     },
 }
 
@@ -271,6 +276,7 @@ where
             ctrl_handle: Box::new(ctrl_handle),
             recv_task,
             inbound_requests: HashMap::new(),
+            pending_proofs: Box::new(HashMap::new()),
         })
     }
 
@@ -307,6 +313,7 @@ where
             output_port,
             ctrl_handle,
             inbound_requests,
+            pending_proofs,
             ..
         } = state
         else {
@@ -325,6 +332,13 @@ where
 
                 for (peer, channel) in subscriptions.iter() {
                     subscriber.send(NetworkEvent::PeerSubscribed(*peer, *channel));
+                }
+
+                for (peer_id, proof) in pending_proofs.iter() {
+                    subscriber.send(NetworkEvent::ValidatorProofReceived {
+                        peer_id: *peer_id,
+                        proof: proof.clone(),
+                    });
                 }
 
                 subscriber.subscribe_to_port(output_port);
@@ -431,6 +445,7 @@ where
             Msg::NewEvent(Event::PeerDisconnected(peer_id)) => {
                 peers.remove(&peer_id);
                 subscriptions.retain(|(peer, _)| *peer != peer_id);
+                pending_proofs.remove(&peer_id);
                 output_port.send(NetworkEvent::PeerDisconnected(peer_id));
             }
 
@@ -570,6 +585,7 @@ where
                 }
 
                 debug!(%peer_id, public_key = %hex::encode(&proof.public_key), "Received validator proof");
+                pending_proofs.insert(peer_id, proof.clone());
                 output_port.send(NetworkEvent::ValidatorProofReceived { peer_id, proof });
             }
 
@@ -664,6 +680,7 @@ where
                 public_key,
             } => {
                 debug!(%peer_id, ?result, public_key = ?public_key.as_ref().map(hex::encode), "Sending validator proof verification result");
+                pending_proofs.remove(&peer_id);
                 ctrl_handle
                     .validator_proof_verified(peer_id, result, public_key)
                     .await?;

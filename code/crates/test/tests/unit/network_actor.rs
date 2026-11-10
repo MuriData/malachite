@@ -1,19 +1,37 @@
-//! Tests that the network a `Network` actor starts ends with the actor, however
-//! the actor stops. Ractor kills the children of a stopping actor, and a killed
-//! actor skips `post_stop`, where the actor shuts its network down.
+//! Tests of the `Network` actor.
+//!
+//! The network the actor starts ends with the actor, however the actor stops.
+//! Ractor kills the children of a stopping actor, and a killed actor skips
+//! `post_stop`, where the actor shuts its network down.
+//!
+//! A subscriber is sent the validator proofs the actor received before it
+//! subscribed and whose verification has not been reported. A peer sends its
+//! proof once per session, and peers connect as soon as the network starts,
+//! before the consensus actor subscribes to it.
 
 use std::net::TcpListener;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use libp2p_identity::{Keypair, PeerId};
+use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 
 use arc_malachitebft_test::codec::proto::ProtobufCodec;
-use arc_malachitebft_test::TestContext;
+use arc_malachitebft_test::{Ed25519Signer, TestContext};
 
 use malachitebft_app::spawn::{spawn_network_actor, spawn_node_actor};
+use malachitebft_codec::Codec;
 use malachitebft_config::{ConsensusConfig, P2pConfig, ValueSyncConfig};
-use malachitebft_engine::network::{Multiaddr, NetworkIdentity, NetworkMsg, NetworkRef};
+use malachitebft_engine::network::{
+    Multiaddr, NetworkEvent, NetworkIdentity, NetworkMsg, NetworkRef,
+};
 use malachitebft_metrics::{Metrics, SharedRegistry};
+use malachitebft_network::validator_proof::ProofVerificationResult;
+use malachitebft_network::PeerIdExt;
+use malachitebft_signing::Signer;
+use malachitebft_signing_ed25519::PrivateKey;
 
 /// How long a peer may still hold a connection to a network whose actor stopped.
 const CLOSE_BOUND: Duration = Duration::from_secs(5);
@@ -36,6 +54,15 @@ async fn spawn_network(
     listen_addr: Multiaddr,
     persistent_peers: Vec<Multiaddr>,
 ) -> NetworkRef<TestContext> {
+    let identity = NetworkIdentity::new(moniker.to_string(), keypair, None);
+    spawn_network_as(identity, listen_addr, persistent_peers).await
+}
+
+async fn spawn_network_as(
+    identity: NetworkIdentity,
+    listen_addr: Multiaddr,
+    persistent_peers: Vec<Multiaddr>,
+) -> NetworkRef<TestContext> {
     let consensus = ConsensusConfig {
         p2p: P2pConfig {
             listen_addr,
@@ -48,7 +75,7 @@ async fn spawn_network(
     spawn_network_actor(
         &consensus,
         &ValueSyncConfig::default(),
-        NetworkIdentity::new(moniker.to_string(), keypair, None),
+        identity,
         &SharedRegistry::new(Default::default(), None),
         ProtobufCodec,
     )
@@ -155,4 +182,146 @@ async fn stopped_node_closes_its_network_connections() {
     node.stop(None);
 
     assert_peer_lets_go(pair, "stopped with its node").await;
+}
+
+/// The identity of a validator whose consensus key comes from `seed`, with its
+/// signed proof, and the key's bytes.
+async fn validator_identity(
+    moniker: &str,
+    keypair: Keypair,
+    seed: u64,
+) -> (NetworkIdentity, Vec<u8>) {
+    let private_key = PrivateKey::generate(StdRng::seed_from_u64(seed));
+    let public_key = private_key.public_key().as_bytes().to_vec();
+    let peer_id = keypair.public().to_peer_id().to_bytes();
+    let proof = Ed25519Signer::new(private_key)
+        .sign_validator_proof(public_key.clone(), peer_id)
+        .await
+        .expect("sign the validator proof");
+    let proof = ProtobufCodec
+        .encode(&proof)
+        .expect("encode the validator proof");
+    let identity =
+        NetworkIdentity::new_validator(moniker.to_string(), keypair, moniker.to_string(), proof);
+    (identity, public_key)
+}
+
+/// Records the peers whose validator proofs a subscriber of a network is sent.
+struct ProofRecorder;
+
+enum RecorderMsg {
+    /// An event of the network: the peer of a validator proof, or none for
+    /// another event.
+    Event(Option<PeerId>),
+    Proofs(RpcReplyPort<Vec<PeerId>>),
+}
+
+impl From<NetworkEvent<TestContext>> for RecorderMsg {
+    fn from(event: NetworkEvent<TestContext>) -> Self {
+        match event {
+            NetworkEvent::ValidatorProofReceived { peer_id, .. } => {
+                Self::Event(Some(peer_id.to_libp2p()))
+            }
+            _ => Self::Event(None),
+        }
+    }
+}
+
+#[async_trait]
+impl Actor for ProofRecorder {
+    type Msg = RecorderMsg;
+    type State = Vec<PeerId>;
+    type Arguments = ();
+
+    async fn pre_start(
+        &self,
+        _myself: ActorRef<RecorderMsg>,
+        _args: (),
+    ) -> Result<Vec<PeerId>, ActorProcessingErr> {
+        Ok(Vec::new())
+    }
+
+    async fn handle(
+        &self,
+        _myself: ActorRef<RecorderMsg>,
+        msg: RecorderMsg,
+        proofs: &mut Vec<PeerId>,
+    ) -> Result<(), ActorProcessingErr> {
+        match msg {
+            RecorderMsg::Event(Some(peer_id)) => proofs.push(peer_id),
+            RecorderMsg::Event(None) => {}
+            RecorderMsg::Proofs(reply) => {
+                let _ = reply.send(proofs.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Subscribes a new recorder to `network`, and returns it once the network has
+/// sent it what it sends a new subscriber.
+async fn subscribe_recorder(network: &NetworkRef<TestContext>) -> ActorRef<RecorderMsg> {
+    let (recorder, _) = Actor::spawn(None, ProofRecorder, ())
+        .await
+        .expect("spawn the recorder");
+    network
+        .cast(NetworkMsg::Subscribe(Box::new(recorder.clone())))
+        .expect("the network actor runs");
+    // The network handles its messages in order, so once it has answered this
+    // it has sent the recorder all it sends on a subscription, which the recorder
+    // handles before a later message.
+    ractor::call!(network, NetworkMsg::DumpState).expect("the network actor replies");
+    recorder
+}
+
+async fn proofs_sent(recorder: &ActorRef<RecorderMsg>) -> Vec<PeerId> {
+    ractor::call!(recorder, RecorderMsg::Proofs).expect("the recorder replies")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_subscriber_is_sent_the_proofs_not_yet_verified() {
+    let node_addr = free_address();
+    let node = spawn_network(
+        "network-actor-node",
+        Keypair::generate_ed25519(),
+        node_addr.clone(),
+        vec![],
+    )
+    .await;
+    let early = subscribe_recorder(&node).await;
+
+    let validator_keypair = Keypair::generate_ed25519();
+    let validator_id = validator_keypair.public().to_peer_id();
+    let (identity, public_key) =
+        validator_identity("network-actor-validator", validator_keypair, 7).await;
+    let validator = spawn_network_as(identity, free_address(), vec![node_addr]).await;
+
+    let deadline = tokio::time::Instant::now() + CONNECT_BOUND;
+    while !proofs_sent(&early).await.contains(&validator_id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the node did not receive the validator's proof"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The proof arrived before this subscriber, as it does before the consensus
+    // actor subscribes when peers connect at once.
+    let late = subscribe_recorder(&node).await;
+    assert_eq!(proofs_sent(&late).await, vec![validator_id]);
+
+    node.cast(NetworkMsg::ValidatorProofVerified {
+        peer_id: malachitebft_network::PeerId::from_libp2p(&validator_id),
+        result: ProofVerificationResult::Valid,
+        public_key: Some(public_key),
+    })
+    .expect("the network actor runs");
+    let after = subscribe_recorder(&node).await;
+    assert!(
+        proofs_sent(&after).await.is_empty(),
+        "a verified proof is not verified again"
+    );
+
+    validator.stop(None);
+    node.stop(None);
 }

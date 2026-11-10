@@ -43,6 +43,7 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 malachitebft-metrics.workspace = true
+malachitebft-network.workspace = true
 malachitebft-test-app.workspace = true
 malachitebft-test-framework.workspace = true
 
