@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use eyre::eyre;
 use ractor::{async_trait, Actor, ActorProcessingErr, ActorRef, RpcReplyPort, SpawnErr};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, info, warn};
 
 use malachitebft_core_consensus::Input;
@@ -41,6 +41,8 @@ where
         }
     }
 
+    /// Spawns the WAL actor on the log at `path`, and returns it with its worker thread, which
+    /// owns the log and can outlive the actor.
     pub async fn spawn(
         _ctx: &Ctx,
         codec: Codec,
@@ -48,10 +50,49 @@ where
         _metrics: SharedRegistry,
         span: tracing::Span,
         node: NodeRef,
-    ) -> Result<WalRef<Ctx>, SpawnErr> {
-        let (actor_ref, _) =
-            Actor::spawn(None, Self::new(span), Args { path, codec, node }).await?;
-        Ok(actor_ref)
+    ) -> Result<(WalRef<Ctx>, WalWorker), SpawnErr> {
+        let (running, worker) = WalWorker::new();
+        let args = Args {
+            path,
+            codec,
+            node,
+            running,
+        };
+        let (actor_ref, _) = Actor::spawn(None, Self::new(span), args).await?;
+        Ok((actor_ref, worker))
+    }
+}
+
+/// The worker thread of a [`Wal`] actor, which owns the log file and performs the actor's
+/// operations on it, one at a time.
+///
+/// The worker exits once its actor has stopped, however it stopped: it finishes the operation it
+/// is performing and closes the log file. Ractor kills the children of a stopping actor, such as
+/// the [`Node`](crate::node::Node), and a killed actor skips `post_stop`, so the worker can still
+/// be writing to the log after the actor and its node are gone. Wait for it before the log is
+/// read or opened again, as by a node started again in the same process.
+#[derive(Clone, Debug)]
+pub struct WalWorker {
+    /// Closed when the worker drops its sender as it exits, once it has closed the log file.
+    running: watch::Receiver<()>,
+}
+
+impl WalWorker {
+    fn new() -> (watch::Sender<()>, Self) {
+        let (running, receiver) = watch::channel(());
+        (running, Self { running: receiver })
+    }
+
+    /// Returns whether the worker has exited, having closed the log file.
+    pub fn is_finished(&self) -> bool {
+        self.running.has_changed().is_err()
+    }
+
+    /// Waits until the worker has exited, having closed the log file.
+    pub async fn finished(&self) {
+        let mut running = self.running.clone();
+        // The worker sends nothing, so this returns once its sender is dropped.
+        while running.changed().await.is_ok() {}
     }
 }
 
@@ -69,6 +110,9 @@ pub struct Args<Codec> {
     pub path: PathBuf,
     pub codec: Codec,
     pub node: NodeRef,
+    /// The sender of the [`WalWorker`] that [`Wal::spawn`] returns, which the worker thread drops
+    /// as it exits.
+    running: watch::Sender<()>,
 }
 
 pub struct State<Ctx: Context> {
@@ -253,7 +297,14 @@ where
         // It holds a NodeRef to signal a safety failure if it panics —
         // otherwise the WAL actor would outlive its dead worker and stall
         // consensus silently.
-        let handle = self::thread::spawn(self.span.clone(), log, args.codec, rx, args.node);
+        let handle = self::thread::spawn(
+            self.span.clone(),
+            log,
+            args.codec,
+            rx,
+            args.node,
+            args.running,
+        );
 
         Ok(State {
             height: Ctx::Height::ZERO,

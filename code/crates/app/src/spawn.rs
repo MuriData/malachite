@@ -15,7 +15,7 @@ use malachitebft_engine::node::{Node, NodeRef};
 use malachitebft_engine::sync::{Params as SyncParams, Sync, SyncCodec, SyncMsg, SyncRef};
 use malachitebft_engine::util::events::TxEvent;
 use malachitebft_engine::util::output_port::OutputPort;
-use malachitebft_engine::wal::{Wal, WalCodec, WalRef};
+use malachitebft_engine::wal::{Wal, WalCodec, WalRef, WalWorker};
 use malachitebft_network::{
     ChannelNames, Config as NetworkConfig, DiscoveryConfig, GossipSubConfig, NetworkIdentity,
 };
@@ -114,13 +114,15 @@ where
     .map_err(Into::into)
 }
 
+/// Spawn the [`Wal`] actor, and return it with its worker thread, which owns the log and can
+/// outlive the actor (see [`WalWorker`]).
 pub async fn spawn_wal_actor<Ctx, Codec>(
     ctx: &Ctx,
     codec: Codec,
     path: &Path,
     registry: &SharedRegistry,
     node: NodeRef,
-) -> Result<WalRef<Ctx>>
+) -> Result<(WalRef<Ctx>, WalWorker)>
 where
     Ctx: Context,
     Codec: WalCodec<Ctx>,

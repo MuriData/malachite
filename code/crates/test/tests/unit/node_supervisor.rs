@@ -17,7 +17,7 @@ use malachitebft_codec::Codec;
 use malachitebft_core_consensus::Input;
 use malachitebft_core_types::{NilOrVal, Round, SignedVote};
 use malachitebft_engine::node::{Node, NodeRef};
-use malachitebft_engine::wal::{Msg as WalMsg, Wal, WalRef};
+use malachitebft_engine::wal::{Msg as WalMsg, Wal, WalRef, WalWorker};
 use malachitebft_metrics::{Metrics, SharedRegistry};
 
 /// A codec that decodes via [`ProtobufCodec`] but panics on every encode.
@@ -54,8 +54,8 @@ async fn spawn_node() -> (NodeRef, Metrics) {
     (node_ref, metrics)
 }
 
-async fn spawn_wal(node: NodeRef, path: std::path::PathBuf) -> WalRef<TestContext> {
-    let wal = Wal::<TestContext, PanickingCodec>::spawn(
+async fn spawn_wal(node: NodeRef, path: std::path::PathBuf) -> (WalRef<TestContext>, WalWorker) {
+    Wal::<TestContext, PanickingCodec>::spawn(
         &TestContext::default(),
         PanickingCodec,
         path,
@@ -64,8 +64,7 @@ async fn spawn_wal(node: NodeRef, path: std::path::PathBuf) -> WalRef<TestContex
         node,
     )
     .await
-    .expect("spawn Wal");
-    wal
+    .expect("spawn Wal")
 }
 
 async fn wait_gauge(metrics: &Metrics, target: i64, timeout: Duration) -> bool {
@@ -91,7 +90,7 @@ async fn wal_worker_thread_panic_triggers_node_safety_hang() {
     let tmp = TempDir::new().expect("tempdir");
     let wal_path = tmp.path().join("wal");
 
-    let wal: WalRef<TestContext> = spawn_wal(node.clone(), wal_path).await;
+    let (wal, worker) = spawn_wal(node.clone(), wal_path).await;
     wal.link(node.get_cell());
 
     // Drive the WAL to a specific height so Append is not rejected as
@@ -121,6 +120,11 @@ async fn wal_worker_thread_panic_triggers_node_safety_hang() {
         wait_gauge(&metrics, 1, Duration::from_secs(5)).await,
         "node_safety_failure should flip to 1 after WAL worker panic"
     );
+
+    // The worker closed the log as it unwound.
+    tokio::time::timeout(Duration::from_secs(5), worker.finished())
+        .await
+        .expect("the WAL worker should have exited after its panic");
 
     // The Node itself must remain alive. Give the supervisor a moment to process
     // the WAL actor's termination, then check it's still up.

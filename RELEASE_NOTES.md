@@ -3,7 +3,11 @@
 ## Unreleased
 
 ### `engine`
+- Report when the worker thread of the WAL actor has closed the log. The worker performs the actor's operations on the log file and exits once the actor has gone, after the operation it is performing. Ractor kills the children of a stopping actor, and a killed actor skips `post_stop`, so the worker of a node that stopped or crashed could still be appending to the log after the node was gone, and nothing told when it was done: a node started again in the same process could find the log still locked, or its last entry half written. `Wal::spawn` returns the actor with a `WalWorker`, which reports when the worker has exited and closed the log
 - Send a new subscriber of the network actor the validator proofs that arrived before it subscribed and whose verification has not been reported. A peer sends its proof once per session, and the network connects to its persistent peers as soon as it is spawned, before the consensus actor subscribes to it, so a proof that arrived in between went to no subscriber and its peer stayed unverified for the whole session
+
+### `app-channel`
+- Keep the default WAL actor's `WalWorker` in `EngineHandle::wal`. Wait for it after the engine has stopped, before the WAL is opened again
 
 ### `network`
 - Stop the network task when its control handle is dropped without a shutdown. The engine's network actor shuts its network down in `post_stop`, which ractor skips when it kills an actor, as it does to the children of a stopping actor. A node that stopped or crashed therefore left its network connected to its peers until the network next failed to hand an event to the dead actor, and a node started again in the same process could meet peers that still held a connection of its last run

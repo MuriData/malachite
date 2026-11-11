@@ -4,11 +4,17 @@
 
 ### `malachitebft-engine`
 
+- `wal::Wal::spawn` returns `(WalRef<Ctx>, WalWorker)`, the actor with its worker thread, which reports when it has closed the log. `wal::Args` gained a private field, so only `Wal::spawn` builds it.
 - `network::State::Running` gained a `pending_proofs` field, the validator proofs received whose verification has not been reported, which the actor sends to each new subscriber. Code that builds or matches this variant without `..` must add the field.
 - `HostMsg::ProcessSyncedValue` gained a `value_id: ValueId<Ctx>` field, the value ID of the verified commit certificate, so that the host can refuse other values before it stores them. Hosts that build or match this variant must add the field.
 
+### `malachitebft-app`
+
+- `spawn::spawn_wal_actor` returns `(WalRef<Ctx>, WalWorker)`, the WAL actor with its worker thread.
+
 ### `malachitebft-app-channel`
 
+- `EngineHandle` gained a `wal: Option<WalWorker>` field, the worker of the default WAL actor or `None` for a custom one, and `EngineHandle::new` takes it as a third argument.
 - `AppMsg::ProcessSyncedValue` gained the same `value_id: ValueId<Ctx>` field. Applications that match this variant must add it.
 
 ## 0.8.1

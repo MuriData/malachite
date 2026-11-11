@@ -778,11 +778,18 @@ where
             network.link(node.get_cell());
 
             // 3. WAL actor (default or custom)
-            let wal = match wal_builder {
-                WalBuilder::Custom(wal_ref) => wal_ref,
+            let (wal, wal_worker) = match wal_builder {
+                WalBuilder::Custom(wal_ref) => (wal_ref, None),
                 WalBuilder::Default(wal_ctx) => {
-                    spawn_wal_actor(&ctx, wal_ctx.codec, &wal_ctx.path, &registry, node.clone())
-                        .await?
+                    let (wal, worker) = spawn_wal_actor(
+                        &ctx,
+                        wal_ctx.codec,
+                        &wal_ctx.path,
+                        &registry,
+                        node.clone(),
+                    )
+                    .await?;
+                    (wal, Some(worker))
                 }
             };
             wal.link(node.get_cell());
@@ -856,7 +863,7 @@ where
                 net_requests: tx_net_request,
             };
 
-            let handle = EngineHandle::new(node, node_join_handle);
+            let handle = EngineHandle::new(node, node_join_handle, wal_worker);
 
             Ok((channels, handle))
         }

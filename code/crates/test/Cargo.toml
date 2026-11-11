@@ -42,10 +42,12 @@ signature = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+malachitebft-app-channel.workspace = true
 malachitebft-metrics.workspace = true
 malachitebft-network.workspace = true
 malachitebft-test-app.workspace = true
 malachitebft-test-framework.workspace = true
+malachitebft-wal.workspace = true
 
 bytesize.workspace = true
 ractor.workspace = true

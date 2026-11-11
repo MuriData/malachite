@@ -4,7 +4,7 @@ use std::thread::JoinHandle;
 use std::{io, thread};
 
 use eyre::{eyre, Result};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, info};
 
 use malachitebft_core_types::{Context, Height};
@@ -33,6 +33,7 @@ pub fn spawn<Ctx, Codec>(
     codec: Codec,
     mut rx: mpsc::Receiver<WalMsg<Ctx>>,
     node: NodeRef,
+    running: watch::Sender<()>,
 ) -> JoinHandle<()>
 where
     Ctx: Context,
@@ -67,6 +68,9 @@ where
                 "WAL worker thread panicked: {reason}"
             )));
         }
+
+        // The log is closed by now, however the loop ended: tell the `WalWorker`.
+        drop(running);
     })
 }
 

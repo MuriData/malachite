@@ -544,6 +544,7 @@ name = "arc-malachitebft-test"
 version = "0.8.2"
 dependencies = [
  "arc-malachitebft-app",
+ "arc-malachitebft-app-channel",
  "arc-malachitebft-codec",
  "arc-malachitebft-config",
  "arc-malachitebft-core-consensus",
@@ -559,6 +560,7 @@ dependencies = [
  "arc-malachitebft-sync",
  "arc-malachitebft-test-app",
  "arc-malachitebft-test-framework",
+ "arc-malachitebft-wal",
  "async-trait",
  "base64",
  "bytes",

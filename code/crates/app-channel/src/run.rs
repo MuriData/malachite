@@ -9,6 +9,7 @@ use eyre::Result;
 use malachitebft_engine::consensus::{ConsensusMsg, ConsensusRef};
 use malachitebft_engine::network::{NetworkMsg, NetworkRef};
 use malachitebft_engine::node::NodeRef;
+use malachitebft_engine::wal::WalWorker;
 
 pub use malachitebft_engine::network::NetworkIdentity;
 pub use malachitebft_signing::{Signer, Verifier, VerifierExt};
@@ -27,11 +28,15 @@ use crate::{Channels, EngineBuilder};
 pub struct EngineHandle {
     pub actor: NodeRef,
     pub handle: JoinHandle<()>,
+    /// The worker thread of the default WAL actor, or `None` for a custom WAL actor. It can still
+    /// be writing to the WAL once the engine has stopped: wait for it before the WAL is opened
+    /// again.
+    pub wal: Option<WalWorker>,
 }
 
 impl EngineHandle {
-    pub fn new(actor: NodeRef, handle: JoinHandle<()>) -> Self {
-        Self { actor, handle }
+    pub fn new(actor: NodeRef, handle: JoinHandle<()>, wal: Option<WalWorker>) -> Self {
+        Self { actor, handle, wal }
     }
 }
 
