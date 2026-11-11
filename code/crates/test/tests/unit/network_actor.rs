@@ -4,10 +4,10 @@
 //! Ractor kills the children of a stopping actor, and a killed actor skips
 //! `post_stop`, where the actor shuts its network down.
 //!
-//! A subscriber is sent the validator proofs the actor received before it
-//! subscribed and whose verification has not been reported. A peer sends its
-//! proof once per session, and peers connect as soon as the network starts,
-//! before the consensus actor subscribes to it.
+//! A subscriber is sent the validator proofs that the actor received before it
+//! subscribed, from peers still connected, and whose verification has not been
+//! reported. A peer sends its proof once per session, and peers connect as soon
+//! as the network starts, before the consensus actor subscribes to it.
 
 use std::net::TcpListener;
 use std::time::Duration;
@@ -206,23 +206,35 @@ async fn validator_identity(
     (identity, public_key)
 }
 
-/// Records the peers whose validator proofs a subscriber of a network is sent.
+/// Records the peers whose validator proofs a subscriber of a network is sent,
+/// and the peers it is told disconnected.
 struct ProofRecorder;
 
+#[derive(Default)]
+struct Recorded {
+    proofs: Vec<PeerId>,
+    disconnections: Vec<PeerId>,
+}
+
 enum RecorderMsg {
-    /// An event of the network: the peer of a validator proof, or none for
-    /// another event.
-    Event(Option<PeerId>),
+    /// The peer of a validator proof the network sent.
+    Proof(PeerId),
+    /// A peer the network reported disconnected.
+    Disconnected(PeerId),
+    /// Another event of the network.
+    Other,
     Proofs(RpcReplyPort<Vec<PeerId>>),
+    Disconnections(RpcReplyPort<Vec<PeerId>>),
 }
 
 impl From<NetworkEvent<TestContext>> for RecorderMsg {
     fn from(event: NetworkEvent<TestContext>) -> Self {
         match event {
             NetworkEvent::ValidatorProofReceived { peer_id, .. } => {
-                Self::Event(Some(peer_id.to_libp2p()))
+                Self::Proof(peer_id.to_libp2p())
             }
-            _ => Self::Event(None),
+            NetworkEvent::PeerDisconnected(peer_id) => Self::Disconnected(peer_id.to_libp2p()),
+            _ => Self::Other,
         }
     }
 }
@@ -230,28 +242,32 @@ impl From<NetworkEvent<TestContext>> for RecorderMsg {
 #[async_trait]
 impl Actor for ProofRecorder {
     type Msg = RecorderMsg;
-    type State = Vec<PeerId>;
+    type State = Recorded;
     type Arguments = ();
 
     async fn pre_start(
         &self,
         _myself: ActorRef<RecorderMsg>,
         _args: (),
-    ) -> Result<Vec<PeerId>, ActorProcessingErr> {
-        Ok(Vec::new())
+    ) -> Result<Recorded, ActorProcessingErr> {
+        Ok(Recorded::default())
     }
 
     async fn handle(
         &self,
         _myself: ActorRef<RecorderMsg>,
         msg: RecorderMsg,
-        proofs: &mut Vec<PeerId>,
+        recorded: &mut Recorded,
     ) -> Result<(), ActorProcessingErr> {
         match msg {
-            RecorderMsg::Event(Some(peer_id)) => proofs.push(peer_id),
-            RecorderMsg::Event(None) => {}
+            RecorderMsg::Proof(peer_id) => recorded.proofs.push(peer_id),
+            RecorderMsg::Disconnected(peer_id) => recorded.disconnections.push(peer_id),
+            RecorderMsg::Other => {}
             RecorderMsg::Proofs(reply) => {
-                let _ = reply.send(proofs.clone());
+                let _ = reply.send(recorded.proofs.clone());
+            }
+            RecorderMsg::Disconnections(reply) => {
+                let _ = reply.send(recorded.disconnections.clone());
             }
         }
         Ok(())
@@ -278,6 +294,22 @@ async fn proofs_sent(recorder: &ActorRef<RecorderMsg>) -> Vec<PeerId> {
     ractor::call!(recorder, RecorderMsg::Proofs).expect("the recorder replies")
 }
 
+async fn disconnections_sent(recorder: &ActorRef<RecorderMsg>) -> Vec<PeerId> {
+    ractor::call!(recorder, RecorderMsg::Disconnections).expect("the recorder replies")
+}
+
+/// Waits until `recorder` has been sent `peer`'s validator proof.
+async fn wait_proof(recorder: &ActorRef<RecorderMsg>, peer: &PeerId) {
+    let deadline = tokio::time::Instant::now() + CONNECT_BOUND;
+    while !proofs_sent(recorder).await.contains(peer) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the node did not receive the validator's proof"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_subscriber_is_sent_the_proofs_not_yet_verified() {
     let node_addr = free_address();
@@ -294,16 +326,8 @@ async fn late_subscriber_is_sent_the_proofs_not_yet_verified() {
     let validator_id = validator_keypair.public().to_peer_id();
     let (identity, public_key) =
         validator_identity("network-actor-validator", validator_keypair, 7).await;
-    let validator = spawn_network_as(identity, free_address(), vec![node_addr]).await;
-
-    let deadline = tokio::time::Instant::now() + CONNECT_BOUND;
-    while !proofs_sent(&early).await.contains(&validator_id) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the node did not receive the validator's proof"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let validator = spawn_network_as(identity, free_address(), vec![node_addr.clone()]).await;
+    wait_proof(&early, &validator_id).await;
 
     // The proof arrived before this subscriber, as it does before the consensus
     // actor subscribes when peers connect at once.
@@ -320,6 +344,27 @@ async fn late_subscriber_is_sent_the_proofs_not_yet_verified() {
     assert!(
         proofs_sent(&after).await.is_empty(),
         "a verified proof is not verified again"
+    );
+
+    // A validator that leaves before its proof is verified takes its proof with it.
+    let leaving_keypair = Keypair::generate_ed25519();
+    let leaving_id = leaving_keypair.public().to_peer_id();
+    let (identity, _) = validator_identity("network-actor-leaving", leaving_keypair, 8).await;
+    let leaving = spawn_network_as(identity, free_address(), vec![node_addr]).await;
+    wait_proof(&early, &leaving_id).await;
+    leaving.stop(None);
+    let deadline = tokio::time::Instant::now() + CLOSE_BOUND;
+    while !disconnections_sent(&early).await.contains(&leaving_id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the node did not report the leaving validator disconnected"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let gone = subscribe_recorder(&node).await;
+    assert!(
+        proofs_sent(&gone).await.is_empty(),
+        "the proof of a peer that is gone is sent"
     );
 
     validator.stop(None);
