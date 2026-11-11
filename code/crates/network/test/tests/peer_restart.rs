@@ -196,12 +196,15 @@ impl Node {
     }
 
     async fn shut_down(self) {
+        // A network ends itself once it fails to hand over an event, so it is
+        // told to shut down while the event task still takes its events.
+        self.ctrl.shutdown().await.unwrap();
         self.events.abort();
         let _ = self.events.await;
         let ctrl = Arc::try_unwrap(self.ctrl)
             .ok()
             .expect("the event task held the only other reference");
-        ctrl.wait_shutdown().await.unwrap();
+        ctrl.join().await.unwrap();
     }
 }
 
